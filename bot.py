@@ -164,73 +164,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # ── 阶段 2：下载（带进度） ──
-    state = {"last_update": 0.0, "text": "", "started": False}
+    # 共享进度状态：同步回调写入，异步轮询读取
+    progress = {
+        "started": False, "pct": 0.0,
+        "downloaded": 0, "total": 0,
+        "speed": None, "eta": None,
+        "done": False,
+    }
 
     def _update_progress(d: dict):
-        now = _time.time()
+        progress["started"] = True
+        progress["pct"] = min(max(float(d.get("percent", 0)), 0), 100)
+        progress["downloaded"] = d.get("downloaded_bytes", 0)
+        progress["total"] = d.get("total_bytes", 0) or d.get("total_bytes_estimate", 0)
+        progress["speed"] = d.get("speed")
+        progress["eta"] = d.get("eta")
 
-        # 第一次回调 → 说明解析完成，开始下载
-        if not state["started"]:
-            state["started"] = True
-            state["last_update"] = now
-            new_text = (
-                "⬇️ 开始下载...\n"
-                "⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪"
-            )
+    # 异步轮询：每 1.5 秒把进度写到 Telegram
+    async def _poll_progress():
+        last_text = ""
+        while not progress["done"]:
+            await asyncio.sleep(1.5)
+            if not progress["started"]:
+                continue
+            p = progress["pct"]
+            bar = _progress_bar(p)
+            sz = _fmt_bytes(progress["downloaded"])
+            sz_t = f" / {_fmt_bytes(progress['total'])}" if progress["total"] else ""
+            spd = f"{_fmt_bytes(progress['speed'])}/s" if progress["speed"] else ""
+            eta = f"剩余 {progress['eta']}s" if progress["eta"] else ""
+            info = " · ".join(filter(None, [f"{sz}{sz_t}", spd, eta]))
+            txt = f"⬇️ 下载中 {p:.1f}%\n{bar}\n📦 {info}"
+            if txt == last_text:
+                continue
+            last_text = txt
             try:
-                loop = asyncio.get_event_loop()
-                loop.call_soon_threadsafe(
-                    lambda t=new_text: asyncio.ensure_future(
-                        status_msg.edit_text(t, parse_mode=None)
-                    )
-                )
+                await status_msg.edit_text(txt, parse_mode=None)
             except Exception:
                 pass
 
-        # 节流 1.5 秒
-        if now - state["last_update"] < 1.5:
-            return
-        state["last_update"] = now
+    poll_task = asyncio.create_task(_poll_progress())
 
-        pct = float(d.get("percent", 0))
-        pct = min(max(pct, 0), 100)
-        downloaded = d.get("downloaded_bytes", 0)
-        total = d.get("total_bytes", 0) or d.get("total_bytes_estimate", 0)
-        speed = d.get("speed")
-        eta = d.get("eta")
-
-        bar = _progress_bar(pct)
-        size = _fmt_bytes(downloaded)
-        size_total = f" / {_fmt_bytes(total)}" if total else ""
-        speed_s = f"{_fmt_bytes(speed)}/s" if speed else ""
-        eta_s = f"剩余 {eta}s" if eta else ""
-
-        parts = " · ".join(filter(None, [f"{size}{size_total}", speed_s, eta_s]))
-
-        new_text = (
-            f"⬇️ 下载中 {pct:.1f}%\n"
-            f"{bar}\n"
-            f"📦 {parts}"
-        )
-
-        if new_text == state["text"]:
-            return
-        state["text"] = new_text
-
-        try:
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(
-                lambda t=new_text: asyncio.ensure_future(
-                    status_msg.edit_text(t, parse_mode=None)
-                )
-            )
-        except Exception:
-            pass
-
-    # ── 执行下载 ──
     result: DownloadResult = await asyncio.get_event_loop().run_in_executor(
         None, download_audio, url, _update_progress
     )
+    progress["done"] = True
+    await poll_task
 
     if not result.success:
         await status_msg.edit_text(
