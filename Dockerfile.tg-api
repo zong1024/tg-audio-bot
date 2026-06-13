@@ -1,0 +1,9 @@
+FROM aiogram/telegram-bot-api:latest
+
+USER root
+RUN apk add --no-cache proxychains-ng
+RUN printf '[ProxyList]\nsocks5 192.168.0.103 1080\n' > /etc/proxychains/proxychains.conf
+RUN mkdir -p /var/lib/telegram-bot-api /tmp/telegram-bot-api && \
+    chown -R telegram-bot-api:telegram-bot-api /var/lib/telegram-bot-api /tmp/telegram-bot-api
+ENTRYPOINT ["proxychains4", "telegram-bot-api"]
+CMD ["--dir=/var/lib/telegram-bot-api", "--temp-dir=/tmp/telegram-bot-api", "--username=telegram-bot-api", "--groupname=telegram-bot-api", "--http-port=8081"]

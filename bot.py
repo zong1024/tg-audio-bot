@@ -18,7 +18,7 @@ from telegram.ext import (
 
 from config import (
     BOT_TOKEN, DOWNLOAD_DIR, AUDIO_FORMAT, ALLOWED_USERS, TG_FILE_LIMIT,
-    HTTP_PROXY, SOCKS_PROXY,
+    HTTP_PROXY, SOCKS_PROXY, LOCAL_API_URL,
 )
 from downloader import is_supported_url, download_audio, DownloadResult
 
@@ -339,6 +339,12 @@ def main():
     download_queue = asyncio.Queue()
 
     builder = Application.builder().token(BOT_TOKEN)
+
+    # 使用 Local Bot API Server（突破 50MB 限制）
+    if LOCAL_API_URL:
+        builder = builder.base_url(f"{LOCAL_API_URL}/bot")
+        print(f"   Local API: {LOCAL_API_URL}")
+
     proxy_url = SOCKS_PROXY or HTTP_PROXY
 
     from telegram.request import HTTPXRequest

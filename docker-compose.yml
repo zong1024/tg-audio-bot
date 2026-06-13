@@ -16,6 +16,9 @@ services:
       - ALL_PROXY=socks5://${PROXY_HOST:-192.168.0.103}:${PROXY_SOCKS_PORT:-1080}
       # B站 Cookies（提升音质到 Hi-Res）
       - BILIBILI_COOKIES=/app/cookies.txt
+      # Local Bot API Server（突破 50MB 上传限制，可达 2GB）
+      - LOCAL_API_URL=http://192.168.0.112:8081
+      - PYTHONUNBUFFERED=1
     volumes:
       # 音频保存到你的 NAS 音乐目录
       - /volume1/@home/ZongRui/Music:/downloads
