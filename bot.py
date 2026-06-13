@@ -66,7 +66,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"音频格式：<code>{AUDIO_FORMAT.upper()}</code>\n\n"
         "命令：\n"
         "/start - 显示帮助\n"
-        "/status - 查看 Bot 状态",
+        "/status - 查看 Bot 状态\n"
+        "/scan - 扫描音乐库",
         parse_mode=ParseMode.HTML,
     )
 
@@ -81,6 +82,54 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"磁盘剩余：<code>{usage.free / (1024**3):.1f} GB</code>",
         parse_mode=ParseMode.HTML,
     )
+
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """扫描音乐文件夹，列出所有音频文件"""
+    import subprocess
+
+    audio_exts = {'.flac', '.aac', '.m4a', '.mp3', '.opus', '.wav', '.ogg', '.eac3'}
+    files = sorted(
+        [f for f in DOWNLOAD_DIR.iterdir() if f.suffix.lower() in audio_exts],
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+
+    if not files:
+        await update.message.reply_text("📂 音乐文件夹为空", parse_mode=None)
+        return
+
+    total_size = sum(f.stat().st_size for f in files)
+    lines = [f"📂 音乐库  共 {len(files)} 首  {_fmt_bytes(total_size)}\n"]
+
+    for i, f in enumerate(files, 1):
+        size = f.stat().st_size
+        # 用 ffprobe 获取时长
+        duration_str = ""
+        try:
+            p = subprocess.run(
+                ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', str(f)],
+                capture_output=True, text=True, timeout=10
+            )
+            if p.stdout.strip():
+                secs = float(p.stdout.strip())
+                m, s = divmod(int(secs), 60)
+                duration_str = f"  {m}:{s:02d}"
+        except Exception:
+            pass
+
+        ext = f.suffix.lstrip('.').upper()
+        name = f.stem
+        lines.append(f"{i}. 🎵 {name}\n    {ext} · {_fmt_bytes(size)}{duration_str}")
+
+    text = "\n".join(lines)
+
+    # Telegram 消息限制 4096 字符，超长截断
+    if len(text) > 4000:
+        text = text[:4000] + f"\n\n... 共 {len(files)} 首，已截断显示"
+
+    await update.message.reply_text(text, parse_mode=None)
 
 
 # ── 消息处理 ──────────────────────────────────────
@@ -278,6 +327,7 @@ def main():
     app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
