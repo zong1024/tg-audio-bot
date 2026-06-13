@@ -1,8 +1,8 @@
 FROM python:3.12-slim
 
-# 安装 ffmpeg（yt-dlp 音频转码依赖）
+# 安装 ffmpeg + Node.js（yt-dlp YouTube 需要 JS 运行时）
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg nodejs && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

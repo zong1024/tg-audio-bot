@@ -392,29 +392,44 @@ def _get_ydl_opts(progress_hook=None) -> dict:
 
 def _download_ytdlp(url: str, progress_hook=None) -> DownloadResult:
     opts = _get_ydl_opts(progress_hook)
+    # 记录下载前已有的文件
+    audio_exts = {'.flac', '.aac', '.m4a', '.mp3', '.opus', '.wav', '.ogg'}
+    before = {f for f in DOWNLOAD_DIR.iterdir() if f.suffix.lower() in audio_exts}
+
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            title = _sanitize_filename(info.get("title", "unknown"))
-            uploader = _sanitize_filename(info.get("uploader", "unknown"))
+            info = ydl.extract_info(url, download=True)
             duration = info.get("duration", 0)
-            ydl.download([url])
+            title = info.get("title", "unknown")
+            uploader = info.get("uploader", "unknown")
 
-            audio_ext = AUDIO_FORMAT if AUDIO_FORMAT != "best" else "m4a"
-            file_path = None
-            for ext in [audio_ext, "flac", "aac", "m4a", "opus", "mp3", "wav"]:
-                candidate = DOWNLOAD_DIR / f"{title} - {uploader}.{ext}"
-                if candidate.exists():
-                    file_path = candidate
-                    break
-            if file_path is None:
-                matches = [m for m in DOWNLOAD_DIR.glob(f"{title} - {uploader}.*")
-                           if m.suffix.lower() not in ('.jpg', '.png', '.webp')]
-                if matches:
-                    file_path = matches[0]
+            # 找到新下载的文件（下载前不存在的音频文件）
+            after = {f for f in DOWNLOAD_DIR.iterdir() if f.suffix.lower() in audio_exts}
+            new_files = after - before
+
+            if new_files:
+                # 取最新的文件
+                file_path = max(new_files, key=lambda f: f.stat().st_mtime)
+            else:
+                # fallback: 按标题搜索
+                file_path = None
+                for ext in ["flac", "aac", "m4a", "mp3", "opus", "wav"]:
+                    for f in DOWNLOAD_DIR.glob(f"*{ext}"):
+                        if f.stat().st_mtime > _time.time() - 60:
+                            file_path = f
+                            break
+                    if file_path:
+                        break
+
             if file_path is None:
                 return DownloadResult(success=False, title=title, uploader=uploader,
                                       error="找不到输出文件")
+
+            # 清理 yt-dlp 下载的封面文件
+            for img in DOWNLOAD_DIR.glob(f"{file_path.stem}.*"):
+                if img.suffix.lower() in ('.jpg', '.png', '.webp'):
+                    img.unlink(missing_ok=True)
+
             return DownloadResult(
                 success=True, file_path=file_path, title=title, uploader=uploader,
                 duration=duration, format_name=file_path.suffix.lstrip('.'),
