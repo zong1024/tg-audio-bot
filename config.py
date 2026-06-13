@@ -21,8 +21,8 @@ ALLOWED_USERS: list[int] = [
 BILIBILI_COOKIES = os.getenv("BILIBILI_COOKIES", "")
 
 # 文件大小上限（字节）：超过此值不发送到 Telegram，只存 NAS
-# Telegram Bot 发送文件上限 50MB
-TG_FILE_LIMIT = int(os.getenv("TG_FILE_LIMIT", str(50 * 1024 * 1024)))
+# Telegram Bot 发送文件上限默认 50MB，使用 Local Bot API 可达 2GB
+TG_FILE_LIMIT = int(os.getenv("TG_FILE_LIMIT", str(100 * 1024 * 1024)))
 
 # 代理配置（YouTube/Telegram 需要翻墙）
 PROXY_HOST = os.getenv("PROXY_HOST", "")
