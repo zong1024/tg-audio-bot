@@ -4,3 +4,5 @@ __pycache__/
 *.tar.gz
 test_*.py
 debug_*.py
+check_*.py
+cookies.txt

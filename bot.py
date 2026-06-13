@@ -212,17 +212,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result.file_size <= TG_FILE_LIMIT and result.file_path:
         try:
             await status_msg.edit_text(done_text + "\n\n📤 正在发送文件...", parse_mode=None)
+            # 读取封面缩略图
+            thumb = None
+            if result.cover_path and result.cover_path.exists():
+                thumb = open(result.cover_path, "rb")
             with open(result.file_path, "rb") as f:
                 await message.reply_audio(
                     audio=f,
                     title=result.title,
                     performer=result.uploader,
+                    duration=result.duration or 0,
                     caption=f"🎵 {result.title}",
+                    thumbnail=thumb,
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=30,
                 )
+            if thumb:
+                thumb.close()
+            # 清理封面临时文件
+            if result.cover_path and result.cover_path.exists():
+                result.cover_path.unlink(missing_ok=True)
             done_text += "\n📤 已发送到聊天"
         except Exception as e:
             logger.warning("发送文件失败: %s", e)
-            done_text += "\n📤 发送失败（文件可能过大）"
+            if result.cover_path and result.cover_path.exists():
+                result.cover_path.unlink(missing_ok=True)
+            done_text += "\n📤 发送失败（文件可能过大或网络超时）"
 
     await status_msg.edit_text(done_text, parse_mode=None)
 
@@ -244,10 +260,20 @@ def main():
 
     builder = Application.builder().token(BOT_TOKEN)
     proxy_url = SOCKS_PROXY or HTTP_PROXY
+
+    # 增大超时（代理 + 大文件上传需要更长时间）
+    from telegram.request import HTTPXRequest
+    req_kwargs = dict(
+        read_timeout=120,
+        write_timeout=120,
+        connect_timeout=30,
+    )
     if proxy_url:
         import httpx
-        builder = builder.proxy(httpx.Proxy(proxy_url))
+        req_kwargs["proxy"] = httpx.Proxy(proxy_url)
         print(f"   代理: {proxy_url}")
+    request = HTTPXRequest(**req_kwargs)
+    builder = builder.request(request)
 
     app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))

@@ -29,6 +29,7 @@ URL_PATTERNS = [
 class DownloadResult:
     success: bool
     file_path: Path | None = None
+    cover_path: Path | None = None
     title: str = ""
     uploader: str = ""
     duration: int = 0
@@ -124,12 +125,12 @@ def _download_bilibili(url: str, progress_hook=None) -> DownloadResult:
         cid = data.get('cid') or data['pages'][0]['cid']
         duration = data.get('duration', 0)
 
-        logger.info("B站视频: %s - %s (cid=%s)", title, uploader, cid)
+        logger.info("B站视频: %s - %s (cid=%s, duration=%ds)", title, uploader, cid, duration)
 
-        # 2. 获取音频流 URL（fnval=16 = DASH 格式，qn=0 = 最高画质）
+        # 2. 获取音频流 URL（fnval=4048 = DASH+Hi-Res+Dolby, fourk=1）
         play_url = (
             f'https://api.bilibili.com/x/player/playurl'
-            f'?bvid={bvid}&cid={cid}&fnval=16&qn=0'
+            f'?bvid={bvid}&cid={cid}&fnval=4048&qn=0&fourk=1'
         )
         play_data = _bili_api_get(play_url)
         if play_data.get('code') != 0:
@@ -139,19 +140,42 @@ def _download_bilibili(url: str, progress_hook=None) -> DownloadResult:
         if not dash:
             return DownloadResult(success=False, error="未获取到 DASH 流信息")
 
-        # 3. 选择最佳音频流
-        audio_streams = dash.get('audio', [])
-        if not audio_streams:
-            return DownloadResult(success=False, error="没有可用的音频流")
+        # 3. 选择最佳音频流（优先 Hi-Res FLAC > Dolby > 普通音频）
+        audio_base_url = None
+        audio_codec = ''
+        audio_ext = 'm4a'
 
-        # 按带宽排序，选最高的
-        best_audio = max(audio_streams, key=lambda s: s.get('bandwidth', 0))
-        audio_base_url = best_audio.get('baseUrl') or best_audio.get('base_url')
-        audio_codec = best_audio.get('codecs', 'mp4a')
-        logger.info("音频流: %s, bandwidth=%s", audio_codec, best_audio.get('bandwidth'))
+        # 优先级 1: Hi-Res FLAC
+        flac_info = dash.get('flac', {})
+        if flac_info and flac_info.get('audio'):
+            audio_base_url = flac_info['audio'].get('baseUrl') or flac_info['audio'].get('base_url')
+            audio_codec = 'flac'
+            audio_ext = 'flac'
+            logger.info("使用 Hi-Res FLAC 流, bandwidth=%s", flac_info['audio'].get('bandwidth'))
+
+        # 优先级 2: Dolby Audio
+        if not audio_base_url:
+            dolby_info = dash.get('dolby', {})
+            if dolby_info and dolby_info.get('audio'):
+                dolby_streams = dolby_info['audio']
+                if isinstance(dolby_streams, list) and dolby_streams:
+                    best_dolby = max(dolby_streams, key=lambda s: s.get('bandwidth', 0))
+                    audio_base_url = best_dolby.get('baseUrl') or best_dolby.get('base_url')
+                    audio_codec = best_dolby.get('codecs', 'ec-3')
+                    audio_ext = 'eac3'
+                    logger.info("使用 Dolby Audio 流, bandwidth=%s", best_dolby.get('bandwidth'))
+
+        # 优先级 3: 普通音频流（按 id 降序选最高质量）
+        if not audio_base_url:
+            audio_streams = dash.get('audio', [])
+            if not audio_streams:
+                return DownloadResult(success=False, error="没有可用的音频流")
+            best_audio = max(audio_streams, key=lambda s: (s.get('id', 0), s.get('bandwidth', 0)))
+            audio_base_url = best_audio.get('baseUrl') or best_audio.get('base_url')
+            audio_codec = best_audio.get('codecs', 'mp4a')
+            logger.info("使用普通音频流, id=%s, bandwidth=%s", best_audio.get('id'), best_audio.get('bandwidth'))
 
         # 4. 下载音频文件（带重试）
-        audio_ext = 'm4a'  # B站音频通常是 AAC/m4a
         temp_path = DOWNLOAD_DIR / f"{title} - {uploader}_temp.{audio_ext}"
 
         import time as _time
@@ -201,31 +225,91 @@ def _download_bilibili(url: str, progress_hook=None) -> DownloadResult:
 
         logger.info("原始音频下载完成: %d MB", downloaded // 1024 // 1024)
 
-        # 5. 转换格式（如果需要）
+        # 4.5 验证下载完整性（检查时长）
+        try:
+            probe = subprocess.run(
+                ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', str(temp_path)],
+                capture_output=True, text=True, timeout=30
+            )
+            actual_duration = float(probe.stdout.strip()) if probe.stdout.strip() else 0
+            logger.info("实际时长: %.1fs, 预期时长: %ds", actual_duration, duration)
+            if duration > 0 and actual_duration < duration * 0.9:
+                logger.warning("音频不完整! 实际 %.1fs < 预期 %ds 的 90%%", actual_duration, duration)
+                temp_path.unlink(missing_ok=True)
+                return DownloadResult(
+                    success=False, title=title, uploader=uploader,
+                    error=f"音频不完整 (实际 {actual_duration:.0f}s, 预期 {duration}s)"
+                )
+        except Exception as e:
+            logger.warning("时长检查失败: %s", e)
+
+        # 4.6 下载视频封面 + 缩放到 320x320（Telegram 缩略图限制）
+        cover_path = DOWNLOAD_DIR / f"{title} - {uploader}_cover.jpg"
+        cover_url = data.get('pic', '')
+        if cover_url:
+            try:
+                if cover_url.startswith('//'):
+                    cover_url = 'https:' + cover_url
+                # 下载原始封面
+                raw_cover = DOWNLOAD_DIR / f"{title} - {uploader}_cover_raw.jpg"
+                req = urllib.request.Request(cover_url, headers=_HEADERS)
+                resp = urllib.request.urlopen(req, timeout=15)
+                with open(raw_cover, 'wb') as f:
+                    f.write(resp.read())
+                # 缩放到 320x320 以内（保持比例）
+                subprocess.run(
+                    ['ffmpeg', '-y', '-i', str(raw_cover),
+                     '-vf', 'scale=320:320:force_original_aspect_ratio=decrease',
+                     '-q:v', '5', str(cover_path)],
+                    capture_output=True, timeout=30
+                )
+                raw_cover.unlink(missing_ok=True)
+                if cover_path.exists():
+                    logger.info("封面下载完成: %d KB", cover_path.stat().st_size // 1024)
+                else:
+                    cover_path = None
+            except Exception as e:
+                logger.warning("封面下载失败: %s", e)
+                cover_path = None
+        else:
+            cover_path = None
+
+        # 5. 转换格式 + 嵌入封面
         target_ext = AUDIO_FORMAT if AUDIO_FORMAT != 'best' else audio_ext
         target_path = DOWNLOAD_DIR / f"{title} - {uploader}.{target_ext}"
 
         if target_ext != audio_ext:
-            # 用 ffmpeg 转码
+            # 用 ffmpeg 转码 + 嵌入封面
             cmd = ['ffmpeg', '-y', '-i', str(temp_path)]
+            if cover_path and cover_path.exists():
+                cmd += ['-i', str(cover_path)]
             if target_ext == 'flac':
                 cmd += ['-c:a', 'flac']
             elif target_ext == 'aac':
                 cmd += ['-c:a', 'aac', '-b:a', '320k']
             elif target_ext == 'mp3':
                 cmd += ['-c:a', 'libmp3lame', '-b:a', '320k']
+            if cover_path and cover_path.exists():
+                cmd += ['-c:v', 'mjpeg', '-map', '0:a', '-map', '1:v',
+                        '-disposition:v:0', 'attached_pic',
+                        '-metadata:s:v', 'title=Album cover',
+                        '-metadata:s:v', 'comment=Cover (front)']
+            cmd += ['-metadata', f'title={title}', '-metadata', f'artist={uploader}']
             cmd.append(str(target_path))
 
-            logger.info("转码: %s → %s", audio_ext, target_ext)
+            logger.info("转码: %s → %s (含封面)", audio_ext, target_ext)
             result = subprocess.run(cmd, capture_output=True, timeout=300)
             if result.returncode != 0:
                 logger.error("ffmpeg 转码失败: %s", result.stderr.decode()[:200])
-                # 转码失败，保留原始文件
                 temp_path.rename(target_path)
             else:
                 temp_path.unlink(missing_ok=True)
         else:
             temp_path.rename(target_path)
+
+        # 保留封面文件供 Telegram 缩略图使用
+        # （下载完成后由 bot 层清理）
 
         file_size = target_path.stat().st_size
         logger.info("B站下载完成: %s (%s, %d MB)", target_path.name, target_ext, file_size // 1024 // 1024)
@@ -233,6 +317,7 @@ def _download_bilibili(url: str, progress_hook=None) -> DownloadResult:
         return DownloadResult(
             success=True,
             file_path=target_path,
+            cover_path=cover_path if cover_path and cover_path.exists() else None,
             title=title,
             uploader=uploader,
             duration=duration,
