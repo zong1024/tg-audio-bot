@@ -1,0 +1,19 @@
+services:
+  tg-audio-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tg-audio-bot
+    restart: unless-stopped
+    environment:
+      # Telegram Bot Token（从 .env 或环境变量读取）
+      - BOT_TOKEN=${BOT_TOKEN}
+      # 音频格式：flac（无损） / aac（原始） / best（不转码）
+      - AUDIO_FORMAT=flac
+      # 代理服务器（你的 Xray 代理）
+      - HTTP_PROXY=http://${PROXY_HOST:-192.168.0.103}:${PROXY_HTTP_PORT:-1081}
+      - HTTPS_PROXY=http://${PROXY_HOST:-192.168.0.103}:${PROXY_HTTP_PORT:-1081}
+      - ALL_PROXY=socks5://${PROXY_HOST:-192.168.0.103}:${PROXY_SOCKS_PORT:-1080}
+    volumes:
+      # 音频保存到你的 NAS 音乐目录
+      - /volume1/@home/ZongRui/Music:/downloads
