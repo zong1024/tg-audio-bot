@@ -340,19 +340,21 @@ def main():
 
     builder = Application.builder().token(BOT_TOKEN)
 
-    # 使用 Local Bot API Server（突破 50MB 限制）
-    if LOCAL_API_URL:
-        builder = builder.base_url(f"{LOCAL_API_URL}/bot")
-        print(f"   Local API: {LOCAL_API_URL}")
-
-    proxy_url = SOCKS_PROXY or HTTP_PROXY
-
     from telegram.request import HTTPXRequest
     req_kwargs = dict(read_timeout=120, write_timeout=120, connect_timeout=30)
-    if proxy_url:
-        import httpx
-        req_kwargs["proxy"] = httpx.Proxy(proxy_url)
-        print(f"   代理: {proxy_url}")
+
+    # 使用 Local Bot API Server（突破 50MB 限制）→ 不走代理（局域网直连）
+    if LOCAL_API_URL:
+        builder = builder.base_url(f"{LOCAL_API_URL}/bot")
+        print(f"   Local API: {LOCAL_API_URL} (直连)")
+    else:
+        # 使用官方 API → 走代理
+        proxy_url = SOCKS_PROXY or HTTP_PROXY
+        if proxy_url:
+            import httpx
+            req_kwargs["proxy"] = httpx.Proxy(proxy_url)
+            print(f"   代理: {proxy_url}")
+
     builder = builder.request(HTTPXRequest(**req_kwargs))
 
     app = builder.build()
