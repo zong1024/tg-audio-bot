@@ -225,7 +225,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - 帮助\n"
         "/status - 状态\n"
         "/queue - 查看下载队列\n"
-        "/scan - 扫描音乐库",
+        "/scan - 扫描音乐库\n"
+        "/delete - 删除音乐",
         parse_mode=ParseMode.HTML,
     )
 
@@ -291,7 +292,104 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=None)
 
 
-# ── 消息处理 ──────────────────────────────────────
+def _get_audio_files():
+    """获取音频文件列表（排序后）"""
+    audio_exts = {'.flac', '.aac', '.m4a', '.mp3', '.opus', '.wav', '.ogg', '.eac3'}
+    return sorted(
+        [f for f in DOWNLOAD_DIR.iterdir() if f.suffix.lower() in audio_exts],
+        key=lambda f: f.stat().st_mtime, reverse=True,
+    )
+
+
+# 待确认删除的文件（user_id -> file_path）
+_pending_delete: dict[int, Path] = {}
+
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """删除音乐文件
+    /delete         → 显示编号列表
+    /delete 3       → 删除第 3 首（需确认）
+    /delete 3 5 7   → 删除多首
+    """
+    args = context.args
+    files = _get_audio_files()
+
+    if not files:
+        await update.message.reply_text("📂 音乐文件夹为空", parse_mode=None)
+        return
+
+    # 无参数：显示列表
+    if not args:
+        lines = ["🗑 删除音乐  发送 /delete <编号>\n"]
+        for i, f in enumerate(files, 1):
+            size = f.stat().st_size / 1024 / 1024
+            lines.append(f"{i}. {f.stem}  ({size:.1f}MB)")
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n... 已截断"
+        await update.message.reply_text(text, parse_mode=None)
+        return
+
+    # 解析编号
+    indices = []
+    for a in args:
+        try:
+            n = int(a)
+            if 1 <= n <= len(files):
+                indices.append(n - 1)
+            else:
+                await update.message.reply_text(f"❌ 编号 {n} 超出范围 (1-{len(files)})", parse_mode=None)
+                return
+        except ValueError:
+            await update.message.reply_text(f"❌ 无效编号: {a}", parse_mode=None)
+            return
+
+    # 确认删除
+    to_delete = [files[i] for i in indices]
+    total_size = sum(f.stat().st_size for f in to_delete) / 1024 / 1024
+    names = "\n".join(f"• {f.stem}" for f in to_delete)
+
+    _pending_delete[update.effective_user.id] = to_delete
+
+    await update.message.reply_text(
+        f"⚠️ 确认删除以下 {len(to_delete)} 个文件？\n\n"
+        f"{names}\n\n"
+        f"共 {total_size:.1f} MB\n\n"
+        f"回复 <b>yes</b> 确认，<b>no</b> 取消",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def handle_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理删除确认"""
+    user_id = update.effective_user.id
+    if user_id not in _pending_delete:
+        return False  # 不是删除确认
+
+    text = update.message.text.strip().lower()
+    files = _pending_delete.pop(user_id)
+
+    if text in ('yes', 'y', '是', '确认'):
+        deleted = []
+        for f in files:
+            try:
+                # 同时删除封面文件
+                cover = f.with_name(f.stem + '_cover.jpg')
+                if cover.exists():
+                    cover.unlink()
+                f.unlink()
+                deleted.append(f.stem)
+            except Exception as e:
+                logger.warning("删除失败 %s: %s", f.name, e)
+
+        await update.message.reply_text(
+            f"✅ 已删除 {len(deleted)} 个文件",
+            parse_mode=None,
+        )
+    else:
+        await update.message.reply_text("❌ 已取消删除", parse_mode=None)
+
+    return True  # 已处理
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -303,6 +401,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not _check_user_allowed(user_id):
         await message.reply_text("❌ 无权限")
+        return
+
+    # 检查是否是删除确认
+    if await handle_delete_confirm(update, context):
         return
 
     # 提取所有链接（支持换行/空格分隔的多链接）
@@ -370,6 +472,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
