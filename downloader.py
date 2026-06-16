@@ -100,7 +100,7 @@ def _extract_bvid(url: str) -> str | None:
 
 def _bili_api_get(url: str) -> dict:
     req = urllib.request.Request(url, headers=_HEADERS)
-    return json.loads(urllib.request.urlopen(req, timeout=15).read())
+    return json.loads(urllib.request.urlopen(req, timeout=30).read())
 
 
 def _cleanup_temp_files():
@@ -194,7 +194,7 @@ def _download_bilibili(url: str, progress_hook=None) -> DownloadResult:
                     req = urllib.request.Request(src_url, headers={
                         **_HEADERS, 'Range': f'bytes={existing}-',
                     })
-                    resp = urllib.request.urlopen(req, timeout=60)
+                    resp = urllib.request.urlopen(req, timeout=120)
                     content_len = int(resp.headers.get('Content-Length', 0))
                     expected_total = content_len + existing
                     cumulative = existing

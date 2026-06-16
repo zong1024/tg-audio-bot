@@ -5,6 +5,7 @@ Telegram Bot - B站/YouTube 高清音频下载（支持批量 + 队列）
 import logging
 import asyncio
 import time as _time
+from pathlib import Path
 from dataclasses import dataclass, field
 from telegram import Update
 from telegram.constants import ParseMode
