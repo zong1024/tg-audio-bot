@@ -1,7 +1,10 @@
 """配置管理 - 从环境变量或 .env 文件加载"""
 
 import os
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Telegram Bot Token（必须）
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -10,7 +13,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/downloads"))
 
 # 音频格式：flac | aac | best（best = 保留原始编码，不转码）
-AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "flac")
+AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "flac").lower()
+_VALID_FORMATS = {"flac", "aac", "mp3", "best"}
+if AUDIO_FORMAT not in _VALID_FORMATS:
+    logger.warning("AUDIO_FORMAT=%s 不在 %s 中，回退到 flac", AUDIO_FORMAT, _VALID_FORMATS)
+    AUDIO_FORMAT = "flac"
 
 # 允许使用 Bot 的 Telegram 用户 ID（逗号分隔），留空 = 所有人可用
 ALLOWED_USERS: list[int] = [
@@ -20,12 +27,13 @@ ALLOWED_USERS: list[int] = [
 # B站 Cookies 文件路径（可选，部分高清内容需要登录态）
 BILIBILI_COOKIES = os.getenv("BILIBILI_COOKIES", "")
 
-# 文件大小上限（字节）：超过此值不发送到 Telegram，只存 NAS
-# 使用 Local Bot API Server 可达 2GB
-TG_FILE_LIMIT = int(os.getenv("TG_FILE_LIMIT", str(2 * 1024 * 1024 * 1024)))
-
 # Telegram Local Bot API Server 地址（留空则使用官方 API）
 LOCAL_API_URL = os.getenv("LOCAL_API_URL", "")
+
+# 文件大小上限（字节）
+# 有 Local API → 2GB，无 → 50MB（官方限制）
+_DEFAULT_LIMIT = 2 * 1024 * 1024 * 1024 if LOCAL_API_URL else 50 * 1024 * 1024
+TG_FILE_LIMIT = int(os.getenv("TG_FILE_LIMIT", str(_DEFAULT_LIMIT)))
 
 # 代理配置（YouTube/Telegram 需要翻墙）
 PROXY_HOST = os.getenv("PROXY_HOST", "")
@@ -37,12 +45,23 @@ if PROXY_HOST:
     HTTP_PROXY = f"http://{PROXY_HOST}:{PROXY_HTTP_PORT}"
     SOCKS_PROXY = f"socks5://{PROXY_HOST}:{PROXY_SOCKS_PORT}"
 else:
-    # 从环境变量读取（Docker 已设置的情况）
     HTTP_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY", "")
     SOCKS_PROXY = os.getenv("ALL_PROXY", "")
 
 # yt-dlp 使用的代理（SOCKS5 优先，YouTube 效果更好）
 YTDL_PROXY = SOCKS_PROXY or HTTP_PROXY
+
+# ── 超时配置（秒）──
+# B站 API 请求超时
+BILI_API_TIMEOUT = int(os.getenv("BILI_API_TIMEOUT", "30"))
+# B站音频下载：单次 socket 超时
+BILI_DL_SOCKET_TIMEOUT = int(os.getenv("BILI_DL_SOCKET_TIMEOUT", "120"))
+# B站/YouTube 下载：整体超时（含重试+转码），超出则取消任务
+DOWNLOAD_TOTAL_TIMEOUT = int(os.getenv("DOWNLOAD_TOTAL_TIMEOUT", "600"))
+# ffmpeg 转码超时
+FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "300"))
+# Telegram 文件上传超时
+TG_UPLOAD_TIMEOUT = int(os.getenv("TG_UPLOAD_TIMEOUT", "300"))
 
 # 确保下载目录存在
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)

@@ -1,12 +1,20 @@
 """
 Telegram Bot - B站/YouTube 高清音频下载（支持批量 + 队列）
+
+可靠性设计：
+- 下载任务有总超时（DOWNLOAD_TOTAL_TIMEOUT），防止卡死阻塞队列
+- cmd_scan 用 run_in_executor 避免阻塞事件循环
+- 封面文件句柄用 try/finally 确保关闭
+- 所有异常都有日志
 """
 
 import logging
 import asyncio
+import shutil
+import subprocess
 import time as _time
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -19,7 +27,8 @@ from telegram.ext import (
 
 from config import (
     BOT_TOKEN, DOWNLOAD_DIR, AUDIO_FORMAT, ALLOWED_USERS, TG_FILE_LIMIT,
-    HTTP_PROXY, SOCKS_PROXY, LOCAL_API_URL,
+    HTTP_PROXY, SOCKS_PROXY, LOCAL_API_URL, DOWNLOAD_TOTAL_TIMEOUT,
+    TG_UPLOAD_TIMEOUT,
 )
 from downloader import is_supported_url, download_audio, DownloadResult
 
@@ -53,13 +62,13 @@ def _fmt_bytes(b: float) -> str:
 class QueueItem:
     url: str
     user_id: int
-    message: object          # telegram.Message（发送链接的原始消息）
-    status_msg: object = None  # telegram.Message（进度消息）
+    message: object
+    status_msg: object = None
     position: int = 0
 
 
 download_queue: asyncio.Queue = None
-queue_items: list[QueueItem] = []   # 可视化队列（正在执行 + 等待中）
+queue_items: list[QueueItem] = []
 
 
 async def _process_queue():
@@ -71,7 +80,10 @@ async def _process_queue():
         except Exception as e:
             logger.exception("队列任务异常: %s", item.url)
             try:
-                await item.status_msg.edit_text(f"❌ 异常: {e}", parse_mode=None)
+                await item.status_msg.edit_text(
+                    f"❌ 下载异常，已跳过\n\n{type(e).__name__}: {e}",
+                    parse_mode=None,
+                )
             except Exception:
                 pass
         finally:
@@ -81,12 +93,11 @@ async def _process_queue():
 
 
 async def _execute_download(item: QueueItem):
-    """执行单个下载任务"""
+    """执行单个下载任务（带总超时）"""
     url = item.url
     message = item.message
     status_msg = item.status_msg
 
-    # 更新队列位置
     _update_queue_positions()
 
     # ── 进度状态 ──
@@ -129,21 +140,36 @@ async def _execute_download(item: QueueItem):
             try:
                 await status_msg.edit_text(txt, parse_mode=None)
             except Exception:
-                pass
+                pass  # 消息被删或未变更，静默忽略
 
     poll_task = asyncio.create_task(_poll_progress())
 
-    result: DownloadResult = await asyncio.get_event_loop().run_in_executor(
-        None, download_audio, url, _update_progress
-    )
-    progress["done"] = True
-    await poll_task
+    # 带总超时的下载（防止卡死阻塞队列）
+    try:
+        result: DownloadResult = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, download_audio, url, _update_progress
+            ),
+            timeout=DOWNLOAD_TOTAL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        progress["done"] = True
+        await poll_task
+        raise RuntimeError(f"下载超时（{DOWNLOAD_TOTAL_TIMEOUT}s），可能是网络问题")
+    finally:
+        progress["done"] = True
+        if not poll_task.done():
+            poll_task.cancel()
+            try:
+                await poll_task
+            except asyncio.CancelledError:
+                pass
 
-    # ── 结果处理 ──
     if not result.success:
         await status_msg.edit_text(f"❌ 下载失败\n\n{result.error}", parse_mode=None)
         return
 
+    # ── 完成消息 ──
     duration_str = ""
     if result.duration:
         m, s = divmod(result.duration, 60)
@@ -163,47 +189,49 @@ async def _execute_download(item: QueueItem):
     if queue_hint:
         done_text += f"\n{queue_hint}"
 
-    # 发送文件
+    # 发送文件（带封面）
     if result.file_size <= TG_FILE_LIMIT and result.file_path:
         try:
             await status_msg.edit_text(done_text + "\n\n📤 正在发送...", parse_mode=None)
             thumb = None
-            if result.cover_path and result.cover_path.exists():
-                thumb = open(result.cover_path, "rb")
-            with open(result.file_path, "rb") as f:
-                await message.reply_audio(
-                    audio=f,
-                    title=result.title,
-                    performer=result.uploader,
-                    duration=result.duration or 0,
-                    caption=f"🎵 {result.title}",
-                    thumbnail=thumb,
-                    read_timeout=120,
-                    write_timeout=120,
-                    connect_timeout=30,
-                )
-            if thumb:
-                thumb.close()
-            if result.cover_path and result.cover_path.exists():
-                result.cover_path.unlink(missing_ok=True)
-            done_text += "\n📤 已发送到聊天"
+            thumb_opened = False
+            try:
+                if result.cover_path and result.cover_path.exists():
+                    thumb = open(result.cover_path, "rb")
+                    thumb_opened = True
+                with open(result.file_path, "rb") as f:
+                    await message.reply_audio(
+                        audio=f,
+                        title=result.title,
+                        performer=result.uploader,
+                        duration=result.duration or 0,
+                        caption=f"🎵 {result.title}",
+                        thumbnail=thumb,
+                        read_timeout=TG_UPLOAD_TIMEOUT,
+                        write_timeout=TG_UPLOAD_TIMEOUT,
+                        connect_timeout=30,
+                    )
+                done_text += "\n📤 已发送到聊天"
+            finally:
+                if thumb_opened and thumb:
+                    thumb.close()
+                if result.cover_path and result.cover_path.exists():
+                    result.cover_path.unlink(missing_ok=True)
         except Exception as e:
-            logger.warning("发送失败: %s", e)
+            logger.warning("发送文件失败: %s", e)
             if result.cover_path and result.cover_path.exists():
                 result.cover_path.unlink(missing_ok=True)
-            done_text += "\n📤 发送失败"
+            done_text += "\n📤 发送失败（文件可能过大或网络超时）"
 
     await status_msg.edit_text(done_text, parse_mode=None)
 
 
 def _update_queue_positions():
-    """更新队列中等待项的位置显示"""
     for i, item in enumerate(queue_items):
         item.position = i
 
 
 def _queue_hint_text() -> str:
-    """生成队列状态提示"""
     waiting = [it for it in queue_items if it.position > 0]
     if not waiting:
         return ""
@@ -233,7 +261,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import shutil
     usage = shutil.disk_usage(str(DOWNLOAD_DIR))
     await update.message.reply_text(
         f"📊 <b>Bot 状态</b>\n\n"
@@ -244,21 +271,36 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """查看当前下载队列"""
     if not queue_items:
         await update.message.reply_text("📋 下载队列为空", parse_mode=None)
         return
-
     lines = [f"📋 下载队列  共 {len(queue_items)} 个任务\n"]
     for i, item in enumerate(queue_items):
         label = "⬇️ 执行中" if i == 0 else f"⏳ 等待 #{i}"
         lines.append(f"{label}  {item.url[:60]}...")
-
     await update.message.reply_text("\n".join(lines), parse_mode=None)
 
 
+# ── /scan：异步获取时长，不阻塞事件循环 ──
+
+def _get_duration_sync(fpath: Path) -> str:
+    """同步获取音频时长（在 executor 中调用）"""
+    try:
+        p = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', str(fpath)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if p.stdout.strip():
+            secs = float(p.stdout.strip())
+            m, s = divmod(int(secs), 60)
+            return f"{m}:{s:02d}"
+    except Exception:
+        pass
+    return ""
+
+
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import subprocess
     audio_exts = {'.flac', '.aac', '.m4a', '.mp3', '.opus', '.wav', '.ogg', '.eac3'}
     files = sorted(
         [f for f in DOWNLOAD_DIR.iterdir() if f.suffix.lower() in audio_exts],
@@ -269,23 +311,19 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     total_size = sum(f.stat().st_size for f in files)
+
+    # 异步获取所有时长（不阻塞事件循环）
+    loop = asyncio.get_event_loop()
+    durations = await asyncio.gather(*[
+        loop.run_in_executor(None, _get_duration_sync, f) for f in files
+    ])
+
     lines = [f"📂 音乐库  共 {len(files)} 首  {_fmt_bytes(total_size)}\n"]
-    for i, f in enumerate(files, 1):
+    for i, (f, dur) in enumerate(zip(files, durations), 1):
         size = f.stat().st_size
-        duration_str = ""
-        try:
-            p = subprocess.run(
-                ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
-                 '-of', 'default=noprint_wrappers=1:nokey=1', str(f)],
-                capture_output=True, text=True, timeout=10
-            )
-            if p.stdout.strip():
-                secs = float(p.stdout.strip())
-                m, s = divmod(int(secs), 60)
-                duration_str = f"  {m}:{s:02d}"
-        except Exception:
-            pass
-        lines.append(f"{i}. 🎵 {f.stem}\n    {f.suffix.lstrip('.').upper()} · {_fmt_bytes(size)}{duration_str}")
+        ext = f.suffix.lstrip('.').upper()
+        dur_str = f"  {dur}" if dur else ""
+        lines.append(f"{i}. 🎵 {f.stem}\n    {ext} · {_fmt_bytes(size)}{dur_str}")
 
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -294,7 +332,6 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _get_audio_files():
-    """获取音频文件列表（排序后）"""
     audio_exts = {'.flac', '.aac', '.m4a', '.mp3', '.opus', '.wav', '.ogg', '.eac3'}
     return sorted(
         [f for f in DOWNLOAD_DIR.iterdir() if f.suffix.lower() in audio_exts],
@@ -302,16 +339,12 @@ def _get_audio_files():
     )
 
 
-# 待确认删除的文件（user_id -> file_path）
-_pending_delete: dict[int, Path] = {}
+# ── /delete ──
+
+_pending_delete: dict[int, list[Path]] = {}
 
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """删除音乐文件
-    /delete         → 显示编号列表
-    /delete 3       → 删除第 3 首（需确认）
-    /delete 3 5 7   → 删除多首
-    """
     args = context.args
     files = _get_audio_files()
 
@@ -319,7 +352,6 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📂 音乐文件夹为空", parse_mode=None)
         return
 
-    # 无参数：显示列表
     if not args:
         lines = ["🗑 删除音乐  发送 /delete <编号>\n"]
         for i, f in enumerate(files, 1):
@@ -331,7 +363,6 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode=None)
         return
 
-    # 解析编号
     indices = []
     for a in args:
         try:
@@ -339,13 +370,13 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if 1 <= n <= len(files):
                 indices.append(n - 1)
             else:
-                await update.message.reply_text(f"❌ 编号 {n} 超出范围 (1-{len(files)})", parse_mode=None)
+                await update.message.reply_text(
+                    f"❌ 编号 {n} 超出范围 (1-{len(files)})", parse_mode=None)
                 return
         except ValueError:
             await update.message.reply_text(f"❌ 无效编号: {a}", parse_mode=None)
             return
 
-    # 确认删除
     to_delete = [files[i] for i in indices]
     total_size = sum(f.stat().st_size for f in to_delete) / 1024 / 1024
     names = "\n".join(f"• {f.stem}" for f in to_delete)
@@ -362,10 +393,9 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理删除确认"""
     user_id = update.effective_user.id
     if user_id not in _pending_delete:
-        return False  # 不是删除确认
+        return False
 
     text = update.message.text.strip().lower()
     files = _pending_delete.pop(user_id)
@@ -374,7 +404,6 @@ async def handle_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         deleted = []
         for f in files:
             try:
-                # 同时删除封面文件
                 cover = f.with_name(f.stem + '_cover.jpg')
                 if cover.exists():
                     cover.unlink()
@@ -382,15 +411,15 @@ async def handle_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TY
                 deleted.append(f.stem)
             except Exception as e:
                 logger.warning("删除失败 %s: %s", f.name, e)
-
         await update.message.reply_text(
-            f"✅ 已删除 {len(deleted)} 个文件",
-            parse_mode=None,
-        )
+            f"✅ 已删除 {len(deleted)} 个文件", parse_mode=None)
     else:
         await update.message.reply_text("❌ 已取消删除", parse_mode=None)
 
-    return True  # 已处理
+    return True
+
+
+# ── 消息处理 ──────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -404,11 +433,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ 无权限")
         return
 
-    # 检查是否是删除确认
     if await handle_delete_confirm(update, context):
         return
 
-    # 提取所有链接（支持换行/空格分隔的多链接）
     urls = []
     for word in text.replace('\n', ' ').split():
         if is_supported_url(word):
@@ -417,7 +444,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not urls:
         return
 
-    # 每个链接独立入队
     for url in urls:
         logger.info("入队: %s (用户 %s)", url, user_id)
         status_msg = await message.reply_text("📋 已加入下载队列...", parse_mode=None)
@@ -432,37 +458,38 @@ def main():
     global download_queue
 
     if not BOT_TOKEN:
-        print("❌ 请设置 BOT_TOKEN")
+        logger.error("请设置 BOT_TOKEN 环境变量")
         return
 
-    print(f"🎵 音频下载 Bot 启动中...")
-    print(f"   格式: {AUDIO_FORMAT}")
-    print(f"   目录: {DOWNLOAD_DIR}")
+    logger.info("🎵 音频下载 Bot 启动中...")
+    logger.info("   格式: %s", AUDIO_FORMAT)
+    logger.info("   目录: %s", DOWNLOAD_DIR)
+    logger.info("   下载超时: %ds", DOWNLOAD_TOTAL_TIMEOUT)
 
     download_queue = asyncio.Queue()
 
     builder = Application.builder().token(BOT_TOKEN)
 
     from telegram.request import HTTPXRequest
-    req_kwargs = dict(read_timeout=120, write_timeout=120, connect_timeout=30)
+    req_kwargs = dict(
+        read_timeout=TG_UPLOAD_TIMEOUT,
+        write_timeout=TG_UPLOAD_TIMEOUT,
+        connect_timeout=30,
+    )
 
-    # 使用 Local Bot API Server（突破 50MB 限制）→ 不走代理（局域网直连）
     if LOCAL_API_URL:
         builder = builder.base_url(f"{LOCAL_API_URL}/bot")
-        print(f"   Local API: {LOCAL_API_URL} (直连)")
+        logger.info("   Local API: %s (直连)", LOCAL_API_URL)
     else:
-        # 使用官方 API → 走代理
         proxy_url = SOCKS_PROXY or HTTP_PROXY
         if proxy_url:
             import httpx
             req_kwargs["proxy"] = httpx.Proxy(proxy_url)
-            print(f"   代理: {proxy_url}")
+            logger.info("   代理: %s", proxy_url)
 
     builder = builder.request(HTTPXRequest(**req_kwargs))
-
     app = builder.build()
 
-    # 启动队列 worker
     async def post_init(application):
         asyncio.create_task(_process_queue())
         logger.info("下载队列 worker 已启动")
