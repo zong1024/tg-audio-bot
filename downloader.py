@@ -329,6 +329,7 @@ def _download_bilibili(url: str, progress_hook=None) -> DownloadResult:
                                   error=f"文件过小 ({actual_size} bytes)，下载可能失败")
 
         # 4.6 完整性校验（时长检查）
+        # 短视频允许更大的绝对差异（编码舍入），长视频用百分比
         try:
             probe = subprocess.run(
                 ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
@@ -338,13 +339,19 @@ def _download_bilibili(url: str, progress_hook=None) -> DownloadResult:
             actual_dur = float(probe.stdout.strip()) if probe.stdout.strip() else 0
             logger.info("时长: %.1fs (预期 %ds)", actual_dur, duration)
             if duration > 0 and actual_dur > 0:
-                ratio = actual_dur / duration
-                if ratio < 0.97:
-                    logger.warning("音频不完整! %.1fs < %ds 的 97%%", actual_dur, duration)
+                diff = duration - actual_dur
+                # 允许差异：max(2秒绝对值, 3%相对值)
+                tolerance = max(2.0, duration * 0.03)
+                if diff > tolerance:
+                    logger.warning("音频不完整! %.1fs vs %ds (差 %.1fs > 容差 %.1f)",
+                                   actual_dur, duration, diff, tolerance)
                     temp_path.unlink(missing_ok=True)
                     return DownloadResult(success=False, title=title, uploader=uploader,
                                           error=f"音频不完整 ({actual_dur:.0f}s / {duration}s)")
-                if ratio > 1.1:
+                elif diff > 0:
+                    logger.info("时长略有差异: %.1fs vs %ds (差 %.1fs，在容差内)",
+                                actual_dur, duration, diff)
+                if actual_dur > duration * 1.1:
                     logger.warning("音频异常长! %.1fs > %ds 的 110%%", actual_dur, duration)
             elif actual_dur == 0:
                 logger.warning("ffprobe 返回 0 时长，文件可能损坏")
