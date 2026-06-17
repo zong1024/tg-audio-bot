@@ -454,6 +454,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── 启动 ──────────────────────────────────────────
 
+def _wait_for_local_api(api_url: str, max_retries: int = 30, interval: int = 5):
+    """等待 Local Bot API 就绪（NAS 重启后可能需要等几十秒）"""
+    import urllib.request
+    test_url = f"{api_url}/bot{BOT_TOKEN}/getMe"
+    for i in range(max_retries):
+        try:
+            with urllib.request.urlopen(test_url, timeout=5) as resp:
+                if resp.status == 200:
+                    logger.info("Local Bot API 已就绪 (第 %d 次尝试)", i + 1)
+                    return
+        except Exception:
+            pass
+        if i == 0:
+            logger.info("等待 Local Bot API 启动... (%s)", api_url)
+        elif i % 5 == 0:
+            logger.info("仍在等待 Local Bot API (%d/%d)...", i, max_retries)
+        _time.sleep(interval)
+    logger.warning("Local Bot API 未就绪，尝试继续启动（可能失败）")
+
 def main():
     global download_queue
 
@@ -467,6 +486,10 @@ def main():
     logger.info("   下载超时: %ds", DOWNLOAD_TOTAL_TIMEOUT)
 
     download_queue = asyncio.Queue()
+
+    # 等待 Local Bot API 就绪（NAS 重启后 API 可能还没启动）
+    if LOCAL_API_URL:
+        _wait_for_local_api(LOCAL_API_URL)
 
     builder = Application.builder().token(BOT_TOKEN)
 

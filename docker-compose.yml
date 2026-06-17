@@ -1,27 +1,37 @@
 services:
+  # Telegram Local Bot API Server（必须先启动）
+  telegram-bot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.tg-api
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - TELEGRAM_API_ID=35573684
+      - TELEGRAM_API_HASH=2fafcc9178bdb386178c9185b8ec0276
+
+  # 音频下载 Bot（依赖 API 服务器）
   tg-audio-bot:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: tg-audio-bot
     restart: unless-stopped
+    network_mode: host
+    depends_on:
+      telegram-bot-api:
+        condition: service_started
     environment:
-      # Telegram Bot Token（从 .env 或环境变量读取）
       - BOT_TOKEN=${BOT_TOKEN}
-      # 音频格式：flac（无损） / aac（原始） / best（不转码）
       - AUDIO_FORMAT=flac
-      # 代理服务器（你的 Xray 代理）
       - HTTP_PROXY=http://${PROXY_HOST:-192.168.0.103}:${PROXY_HTTP_PORT:-1081}
       - HTTPS_PROXY=http://${PROXY_HOST:-192.168.0.103}:${PROXY_HTTP_PORT:-1081}
       - ALL_PROXY=socks5://${PROXY_HOST:-192.168.0.103}:${PROXY_SOCKS_PORT:-1080}
       - NO_PROXY=127.0.0.1,localhost,192.168.0.112
-      # B站 Cookies（提升音质到 Hi-Res）
       - BILIBILI_COOKIES=/app/cookies.txt
-      # Local Bot API Server（突破 50MB 上传限制，可达 2GB）
-      - LOCAL_API_URL=http://192.168.0.112:8081
+      - LOCAL_API_URL=http://127.0.0.1:8081
       - PYTHONUNBUFFERED=1
     volumes:
-      # 音频保存到你的 NAS 音乐目录
-      - /volume1/@home/ZongRui/Music:/downloads
-      # B站 Cookies 文件
+      - ${NAS_PATH:-/volume1/@home/ZongRui/Music}:/downloads
       - ./cookies.txt:/app/cookies.txt:ro
