@@ -15,6 +15,7 @@ import time as _time
 import logging
 import subprocess
 import urllib.request
+import http.cookiejar
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -69,8 +70,64 @@ _HEADERS = {
     'Referer': 'https://www.bilibili.com',
 }
 
+# B站 Cookie-aware opener（登录态大幅提升频率限制）
+_bili_opener = None
+_last_bili_request = 0.0
+
+
+def _get_bili_opener():
+    """构建带 Cookies 的 urllib opener（单例）"""
+    global _bili_opener
+    if _bili_opener is not None:
+        return _bili_opener
+
+    cj = http.cookiejar.MozillaCookieJar()
+    if BILIBILI_COOKIES and Path(BILIBILI_COOKIES).exists():
+        try:
+            cj.load(BILIBILI_COOKIES, ignore_discard=True, ignore_expires=True)
+            logger.info("已加载 B站 Cookies: %s (%d 条)", BILIBILI_COOKIES, len(cj))
+        except Exception as e:
+            logger.warning("加载 B站 Cookies 失败: %s", e)
+    else:
+        logger.info("未配置 B站 Cookies，频率限制较严格")
+
+    _bili_opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cj)
+    )
+    return _bili_opener
+
+
+def _bili_api_get(url: str) -> dict:
+    """调用 B站 API，带 Cookies + 频率限制 + 514 退避"""
+    global _last_bili_request
+    opener = _get_bili_opener()
+
+    # 频率限制：每次请求间隔至少 500ms
+    elapsed = _time.time() - _last_bili_request
+    if elapsed < 0.5:
+        _time.sleep(0.5 - elapsed)
+
+    for attempt in range(3):
+        req = urllib.request.Request(url, headers=_HEADERS)
+        try:
+            with opener.open(req, timeout=BILI_API_TIMEOUT) as resp:
+                _last_bili_request = _time.time()
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 514:
+                wait = 5 * (attempt + 1)  # 5s, 10s, 15s 退避
+                logger.warning("B站频率限制 (514)，等待 %ds 后重试 %d/3", wait, attempt + 1)
+                _time.sleep(wait)
+                if attempt == 2:
+                    raise
+            else:
+                raise
+    # unreachable but keeps type checker happy
+    raise RuntimeError("B站 API 重试耗尽")
+
 
 def _extract_bvid(url: str) -> str | None:
+    # 直接匹配 BV 号
     m = re.search(r'(BV[a-zA-Z0-9]+)', url)
     if m:
         return m.group(1)
@@ -113,13 +170,6 @@ def _extract_bvid(url: str) -> str | None:
             logger.warning("b23.tv urllib 解析失败: %s", e)
 
     return None
-
-
-def _bili_api_get(url: str) -> dict:
-    """调用 B站 API，带超时和自动关闭"""
-    req = urllib.request.Request(url, headers=_HEADERS)
-    with urllib.request.urlopen(req, timeout=BILI_API_TIMEOUT) as resp:
-        return json.loads(resp.read())
 
 
 def _cleanup_temp_files():
@@ -201,10 +251,11 @@ def _download_bilibili(url: str, progress_hook=None) -> DownloadResult:
         temp_path = DOWNLOAD_DIR / f"{title} - {uploader}_temp.{audio_ext}"
 
         def _do_download(src_url: str, dest: Path, hook=None) -> int:
-            """下载文件，3 次重试，带速率熔断（连续 30s 无数据则中止）"""
+            """下载文件，3 次重试，带速率熔断 + 514 退避"""
             cumulative = 0
             expected_total = 0
-            STALL_TIMEOUT = 30  # 连续 30 秒无数据判定为卡死
+            STALL_TIMEOUT = 30
+            opener = _get_bili_opener()
 
             for attempt in range(3):
                 try:
@@ -212,7 +263,7 @@ def _download_bilibili(url: str, progress_hook=None) -> DownloadResult:
                     req = urllib.request.Request(src_url, headers={
                         **_HEADERS, 'Range': f'bytes={existing}-',
                     })
-                    resp = urllib.request.urlopen(req, timeout=BILI_DL_SOCKET_TIMEOUT)
+                    resp = opener.open(req, timeout=BILI_DL_SOCKET_TIMEOUT)
                     try:
                         content_len = int(resp.headers.get('Content-Length', 0))
                         expected_total = content_len + existing
@@ -259,7 +310,11 @@ def _download_bilibili(url: str, progress_hook=None) -> DownloadResult:
                                    attempt + 1, e, cumulative // 1024)
                     if attempt == 2:
                         raise
-                    _time.sleep(2)
+                    # 514 频率限制 → 更长退避
+                    if hasattr(e, 'code') and e.code == 514:
+                        _time.sleep(10 * (attempt + 1))
+                    else:
+                        _time.sleep(2)
 
             return cumulative
 
